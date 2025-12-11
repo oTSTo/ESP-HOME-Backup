@@ -1,0 +1,1070 @@
+substitutions:
+  name: schermo-nfc
+  friendly_name: schermo-nfc
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  min_version: 2024.6.0
+  name_add_mac_suffix: false
+  platformio_options:
+    board_build.flash_mode: dio
+  project:
+    name: esphome.web
+    version: dev
+
+esp32:
+  board: esp32-s3-devkitc-1
+  variant: esp32s3
+  flash_size: 16MB
+  framework:
+    type: esp-idf
+    sdkconfig_options:
+      CONFIG_ESP32S3_DEFAULT_CPU_FREQ_240: y
+      CONFIG_ESP32S3_DATA_CACHE_64KB: y
+      CONFIG_SPIRAM_FETCH_INSTRUCTIONS: y
+      CONFIG_SPIRAM_RODATA: y
+      
+      # --- FIX MEMORIA SSL ---
+      CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC: y
+      CONFIG_SPIRAM_USE_MALLOC: y
+      CONFIG_MBEDTLS_ASYMMETRIC_CONTENT_LEN: y
+      CONFIG_ESP_HTTP_CLIENT_BUFFER_SIZE: "8192"
+      CONFIG_ESP_HTTP_CLIENT_BUFFER_SIZE_TX: "4096"
+
+psram:
+  mode: octal
+  speed: 80MHz
+
+# --- LOGGER OTTIMIZZATO ---
+logger:
+  level: DEBUG
+
+api:
+  encryption:
+    key: "zKO8PEgOhaUBDZgLfcD/v6/bfPukaSO2l36sMnnBJOM="
+
+ota:
+- platform: esphome
+  password: "2a0d6894805e375f1c740ec7c9231448"
+
+# --- CONFIGURAZIONE HTTP GLOBALE ---
+http_request:
+  timeout: 15s
+  verify_ssl: false  # Disabilitato per massima compatibilità
+
+improv_serial:
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap: {}
+
+binary_sensor:
+  - platform: homeassistant
+    id: stato_ingresso_relay3
+    entity_id: switch.esphome_web_76e200_relay_3
+  - platform: homeassistant
+    id: stato_ingresso_relay4
+    entity_id: switch.esphome_web_76e200_relay_4
+  - platform: homeassistant
+    id: stato_bagno_relay6
+    entity_id: switch.esphome_web_76e200_relay_6
+  - platform: homeassistant
+    id: stato_cucinino
+    entity_id: switch.antela_smart_plug_it_2_presa_1
+  - platform: homeassistant
+    id: stato_soppalco_relay1
+    entity_id: switch.esphome_web_75ea84_relay_1
+  - platform: homeassistant
+    id: stato_soppalco_relay2
+    entity_id: switch.esphome_web_75ea84_relay_2
+  - platform: homeassistant
+    id: stato_agenti_relay5
+    entity_id: switch.esphome_web_75ea84_relay_5
+  - platform: homeassistant
+    id: stato_agenti_relay6
+    entity_id: switch.esphome_web_75ea84_relay_6
+  - platform: homeassistant
+    id: stato_sala_riunioni
+    entity_id: switch.esphome_web_75ea84_relay_3
+  - platform: homeassistant
+    id: Ev_Fancoil
+    entity_id: switch.esphome_web_75e2d0_relay_6
+  - platform: homeassistant
+    id: Ventola_Fancoil
+    entity_id: switch.esphome_web_75e2d0_relay_5
+
+captive_portal:
+
+dashboard_import:
+  package_import_url: github://esphome/firmware/esphome-web/esp32s3.yaml@main
+  import_full_config: true
+
+esp32_improv:
+  authorizer: none
+
+web_server:
+  port: 80
+
+# --- VARIABILI GLOBALI ---
+globals:
+  - id: tag_message_active
+    type: bool
+    initial_value: 'false'
+  # Variabile per passare l'ID dallo scanner allo script HTTP
+  - id: nfc_token_id
+    type: std::string
+    initial_value: '""'
+
+# --- SCRIPTS ---
+script:
+  - id: reset_display
+    then:
+      - delay: 5s
+      - lambda: |-
+          id(tag_message_active) = false;
+      - lvgl.page.show: main_pages
+
+  # --- SCRIPT DI INVIO DATI (Separato per non bloccare il WiFi) ---
+  - id: invia_dati_badge
+    mode: restart
+    then:
+      # 1. Pausa per far "sfogare" il lettore NFC ed evitare errori I2C durante il WiFi
+      - delay: 2s
+      
+      - lambda: lv_label_set_text(id(nfc_id_label), "Connessione...");
+      
+      - http_request.post:
+          url: https://hr-omega.datipro.it/api/employee/badge-log
+          capture_response: true 
+          request_headers:
+            Content-Type: application/json
+            Connection: close
+            User-Agent: "Mozilla/5.0 (compatible; ESP32)"
+          
+          body: !lambda |-
+            return "{\"token\": \"" + id(nfc_token_id) + "\"}";
+          
+          on_response:
+            then:
+              - lambda: |-
+                  ESP_LOGD("custom_api", "Status: %d", response->status_code);
+                  ESP_LOGD("custom_api", "Body Len: %d", body.length());
+                  
+                  if (body.length() > 0) {
+                      ESP_LOGD("custom_api", "Body Content: %s", body.c_str());
+
+                      // LOGICA IBRIDA: Prova JSON, se fallisce stampa Testo
+                      bool is_json = json::parse_json(body, [](JsonObject root) -> bool {
+                          if (root.containsKey("message")) {
+                             const char* msg = root["message"];
+                             lv_label_set_text(id(nfc_id_label), msg);
+                             return true;
+                          }
+                          return false;
+                      });
+                      
+                      // Se non è JSON valido, stampiamo il testo grezzo (es. se il server è text/plain)
+                      if (!is_json) {
+                          ESP_LOGD("custom_api", "Parsing JSON fallito, stampo raw text");
+                          // Limitiamo a 50 caratteri per il display
+                          std::string clean_msg = body.substr(0, 50);
+                          lv_label_set_text(id(nfc_id_label), clean_msg.c_str());
+                      }
+
+                  } else {
+                      // Se arriva vuoto
+                      lv_label_set_text(id(nfc_id_label), "Body Vuoto!");
+                  }
+
+              - script.execute: reset_display
+              # Riattiva NFC dopo aver finito
+              - lambda: id(nfc_reader).set_update_interval(1000);
+
+          on_error:
+            then:
+              - lambda: |-
+                  ESP_LOGE("custom_api", "Errore HTTP Request");
+                  lv_label_set_text(id(nfc_id_label), "Err. Connessione");
+                  // Riattiva NFC anche in caso di errore
+                  id(nfc_reader).set_update_interval(1000);
+              - script.execute: reset_display
+
+font:
+  - file: "gfonts://Roboto"
+    id: font1
+    size: 120
+  - file: "gfonts://Roboto"
+    id: font2
+    size: 40
+  - file: "gfonts://Roboto"
+    id: font_grande
+    size: 30
+  - file: "gfonts://Roboto"
+    id: tag_font
+    size: 30
+
+output:
+  - platform: ledc
+    pin: 2
+    frequency: 1220
+    id: gpio_backlight_pwm
+
+light:
+  - platform: monochromatic
+    output: gpio_backlight_pwm
+    name: "Display Backlight"
+    id: back_light
+    restore_mode: ALWAYS_ON
+
+spi:
+  clk_pin: GPIO12
+  mosi_pin: GPIO11
+  miso_pin: GPIO13
+
+i2c:
+  - id: bus_a
+    sda: 44
+    scl: 43
+    scan: true
+
+# --- PN532 CONFIGURATO PER NON BLOCCARE ---
+pn532_i2c:
+  id: nfc_reader
+  i2c_id: bus_a
+  update_interval: 1s
+  on_tag:
+    then:
+      # 1. Metti in pausa il lettore (20s) per liberare la CPU
+      - lambda: id(nfc_reader).set_update_interval(20000);
+      
+      # 2. Salva il Token nella variabile globale
+      - lambda: |-
+          id(nfc_token_id) = x;
+          id(back_light).turn_on();
+          id(tag_message_active) = true;
+          lv_label_set_text(id(nfc_id_label), "Lettura...");
+
+      - homeassistant.tag_scanned: !lambda 'return x;'
+      - lvgl.page.show: pagina_nfc
+      
+      # 3. Lancia lo script (che aspetterà 2 secondi prima di usare il WiFi)
+      - script.execute: invia_dati_badge
+
+touchscreen:
+  platform: xpt2046
+  id: my_touchscreen
+  cs_pin: GPIO38
+  interrupt_pin: GPIO18
+  update_interval: 50ms
+  threshold: 800
+  calibration:
+    x_max: 3800
+    x_min: 200
+    y_max: 3580
+    y_min: 350
+  on_release:
+    - logger.log: "Tocco rilevato, riattivazione dello schermo."
+    - light.turn_on: back_light
+    - lvgl.resume: 
+    - lvgl.widget.redraw: 
+
+display:
+  - platform: rpi_dpi_rgb
+    id: main_display
+    color_order: RGB
+    invert_colors: True
+    update_interval: never
+    auto_clear_enabled: false
+    dimensions:
+      width: 800
+      height: 480
+    de_pin: 40
+    hsync_pin: 39
+    vsync_pin: 41
+    pclk_pin: 42
+    data_pins:
+      red:
+        - 45
+        - 48
+        - 47
+        - 21
+        - 14
+      green:
+        - 5
+        - 6
+        - 7
+        - 15
+        - 16
+        - 4
+      blue:
+        - 8
+        - 3
+        - 46
+        - 9
+        - 1
+
+switch:
+  - platform: template
+    name: "Virtual Switch Spegni Tutto"
+    id: virtual_switch_SpegniTutto
+    optimistic: true
+    restore_mode: ALWAYS_OFF
+
+image:
+  - id: my_image
+    file: "images/omega_2000.png"
+    type: GRAYSCALE
+    transparency: alpha_channel
+  - id: next_icon
+    file: "mdi:chevron-right"
+    type: binary
+  - id: prev_icon
+    file: "mdi:chevron-left" 
+    type: binary
+
+time:
+  - platform: homeassistant
+    id: homeassistant_tempo
+    timezone: Europe/Rome
+
+lvgl:
+  displays:
+    - main_display
+  touchscreens:
+    - my_touchscreen
+  bg_color: 0x655e56
+  theme:
+    button:
+      checked:
+        bg_color: 0xA8D5BA
+        text_color: 0x000000
+  pages:
+    - id: main_pages
+      widgets:
+        - image:
+            id: my_image1
+            src: my_image
+            align: TOP_MID
+            y: 50
+        - label:
+            id: clock_label
+            align: CENTER
+            text: "--:--"
+            text_font: font1
+        - label:
+            id: date_label
+            align: BOTTOM_MID
+            y: -50
+            text: "--/--/----"
+            text_font: font2
+        - button:
+            id: next_page_btn
+            align: RIGHT_MID
+            width: 800
+            height: 480
+            opa: 0
+            on_click:
+              - lvgl.page.next:
+                  animation: OUT_LEFT
+                  time: 700ms
+                  
+    - id: seconda_pagina
+      widgets:
+        - button:
+            bg_color: "0x808080"
+            id: switch_btn_ingresso
+            align: CENTER
+            x: -137
+            y: -140
+            width: 266
+            height: 165
+            checkable: true
+            widgets:
+              - label:
+                  align: CENTER
+                  text: "Luce\nIngresso"
+                  text_align: center
+                  text_font: font_grande
+            on_press:
+              - if:
+                  condition: 
+                    lambda: return id(stato_ingresso_relay3).state || id(stato_ingresso_relay4).state;
+                  then:
+                    - homeassistant.service:
+                        service: switch.turn_off
+                        data:
+                          entity_id: switch.esphome_web_76e200_relay_4
+                    - homeassistant.service:
+                        service: switch.turn_off
+                        data:
+                          entity_id: switch.esphome_web_76e200_relay_3
+                  else:
+                    - homeassistant.service:
+                        service: switch.turn_on
+                        data:
+                          entity_id: switch.esphome_web_76e200_relay_4
+                    - homeassistant.service:
+                        service: switch.turn_on
+                        data:
+                          entity_id: switch.esphome_web_76e200_relay_3
+        - button:
+            id: switch_btn_soppalco
+            align: CENTER
+            x: 137
+            y: -140
+            width: 266
+            height: 165
+            checkable: true
+            bg_color: "0x808080"
+            widgets:
+              - label:
+                  align: CENTER
+                  text: 'Soppalco'
+                  text_font: font_grande
+            on_press:
+              - if:
+                  condition:
+                    lambda: |-
+                      return id(stato_soppalco_relay1).state || id(stato_soppalco_relay2).state;
+                  then:
+                    - homeassistant.service:
+                        service: switch.turn_off
+                        data:
+                          entity_id: switch.esphome_web_75ea84_relay_2
+                    - homeassistant.service:
+                        service: switch.turn_off
+                        data:
+                          entity_id: switch.esphome_web_75ea84_relay_1
+                  else:
+                    - homeassistant.service:
+                        service: switch.turn_on
+                        data:
+                          entity_id: switch.esphome_web_75ea84_relay_2
+                    - homeassistant.service:
+                        service: switch.turn_on
+                        data:
+                          entity_id: switch.esphome_web_75ea84_relay_1
+        - button:
+            id: switch_btn_agenti
+            align: CENTER
+            x: -137
+            y: 40
+            width: 266
+            height: 165
+            checkable: true
+            bg_color: "0x808080"
+            widgets:
+              - label:
+                  align: CENTER
+                  text: "Luce\nAgenti"
+                  text_align: center
+                  text_font: font_grande
+            on_press:
+              - if:
+                  condition:
+                    lambda: |-
+                      return id(stato_agenti_relay5).state || id(stato_agenti_relay6).state;
+                  then:
+                    - homeassistant.service:
+                        service: switch.turn_off
+                        data:
+                          entity_id: switch.esphome_web_75ea84_relay_6
+                    - homeassistant.service:
+                        service: switch.turn_off
+                        data:
+                          entity_id: switch.esphome_web_75ea84_relay_5
+                  else:
+                    - homeassistant.service:
+                        service: switch.turn_on
+                        data:
+                          entity_id: switch.esphome_web_75ea84_relay_6
+                    - homeassistant.service:
+                        service: switch.turn_on
+                        data:
+                          entity_id: switch.esphome_web_75ea84_relay_5
+        - button:
+            id: switch_btn_bagno
+            align: CENTER
+            x: 137
+            y: 40
+            width: 266
+            height: 165
+            checkable: true
+            bg_color: "0x808080"
+            widgets:
+              - label:
+                  align: CENTER
+                  text: 'Bagno'
+                  text_font: font_grande
+            on_press:
+              - if:
+                  condition:
+                    lambda: |-
+                      return id(stato_bagno_relay6).state || id(stato_cucinino).state;
+                  then:
+                    - homeassistant.service:
+                        service: switch.turn_off
+                        data:
+                          entity_id: switch.esphome_web_76e200_relay_6
+                    - homeassistant.service:
+                        service: switch.turn_off
+                        data:
+                          entity_id: switch.antela_smart_plug_it_2_presa_1
+                  else:
+                    - homeassistant.service:
+                        service: switch.turn_on
+                        data:
+                          entity_id:  switch.esphome_web_76e200_relay_6
+                    - homeassistant.service:
+                        service: switch.turn_on
+                        data:
+                          entity_id: switch.antela_smart_plug_it_2_presa_1  
+        - button:
+            id: switch_btn_SpegniTutto
+            align: BOTTOM_MID
+            y: -20
+            width: 540
+            height: 80
+            checkable: true
+            bg_color: "0x808080"
+            widgets:
+              - label:
+                  align: CENTER
+                  text: 'Spegni Tutto'
+                  text_font: font_grande
+            on_press:
+              - homeassistant.service:
+                  service: switch.turn_off
+                  data:
+                    entity_id: switch.esphome_web_76e200_relay_3              
+              - homeassistant.service:
+                  service: switch.turn_off
+                  data:
+                    entity_id: switch.esphome_web_76e200_relay_4
+              - homeassistant.service:
+                  service: switch.turn_off
+                  data:
+                    entity_id: switch.esphome_web_76e200_relay_6
+              - homeassistant.service:
+                  service: switch.turn_off
+                  data:
+                    entity_id: switch.esphome_web_75ea84_relay_1
+              - homeassistant.service:
+                  service: switch.turn_off
+                  data:
+                    entity_id: switch.esphome_web_75ea84_relay_2
+              - homeassistant.service:
+                  service: switch.turn_off
+                  data:
+                    entity_id: switch.esphome_web_75ea84_relay_5
+              - homeassistant.service:
+                  service: switch.turn_off
+                  data:
+                    entity_id: switch.esphome_web_75ea84_relay_6
+              - homeassistant.service:
+                  service: switch.turn_off
+                  data:
+                    entity_id: switch.esphome_web_75ea84_relay_3
+              - homeassistant.service:
+                  service: switch.turn_off
+                  data:
+                    entity_id: switch.esphome_web_75ea84_relay_4
+              - homeassistant.service:
+                  service: switch.turn_off
+                  data: 
+                    entity_id:  switch.esphome_web_75e2d0_relay_6
+              - homeassistant.service:
+                  service: switch.turn_off
+                  data: 
+                    entity_id:  switch.esphome_web_75e2d0_relay_5
+              - homeassistant.service:
+                  service: switch.turn_off
+                  data: 
+                    entity_id:  switch.esphome_web_75e2d0_relay_4
+              - homeassistant.service:
+                  service: switch.turn_off
+                  data: 
+                    entity_id:  switch.esphome_web_75e2d0_relay_3
+              - homeassistant.service:
+                  service: switch.turn_off
+                  data: 
+                    entity_id:  switch.antela_smart_plug_it_presa_1
+              - delay: 1s
+              - lambda: |-
+                  lv_obj_add_state(id(switch_btn_SpegniTutto), LV_STATE_CHECKED);
+              - delay: 1s
+              - lambda: |-
+                  lv_obj_clear_state(id(switch_btn_SpegniTutto), LV_STATE_CHECKED);
+        
+        - image:
+            id: freccia_sinistra
+            src: prev_icon 
+            align: LEFT_MID
+            x: 25
+            on_click:
+              - lvgl.page.previous:
+                  animation: OUT_RIGHT
+                  time: 700ms
+        - button:
+            id: prev_page_btn
+            align: LEFT_MID
+            width: 130
+            height: 480
+            opa: 0
+            on_click:
+              - lvgl.page.previous:
+                  animation: OUT_LEFT
+                  time: 700ms    
+
+        - image:
+            id: freccia_destra
+            src: next_icon 
+            align: RIGHT_MID
+            x: -25
+            on_click:
+              - lvgl.page.next:
+                  animation: OUT_LEFT
+                  time: 700ms
+        - button:
+            id: next_page_button
+            align: RIGHT_MID
+            width: 130
+            height: 480
+            opa: 0
+            on_click:
+              - lvgl.page.next:
+                  animation: OUT_LEFT
+                  time: 700ms
+
+    - id: terza_pagina
+      widgets:
+        - button:
+            id: switch_btn_salariunioni
+            align: CENTER
+            x: -137 
+            y: -50
+            width: 266
+            height: 345
+            checkable: true
+            bg_color: "0x808080"
+            widgets:
+              - label:
+                  align: CENTER
+                  text: "Sala\nRiunioni"
+                  text_align: center
+                  text_font: font_grande
+            on_press:
+              - homeassistant.service:
+                  service: switch.toggle
+                  data:
+                    entity_id: switch.esphome_web_75ea84_relay_3
+        - button:
+            id: switch_btn_fancoil
+            align: CENTER
+            x: 137
+            y: -50
+            width: 266
+            height: 345
+            checkable: true
+            bg_color: "0x808080"
+            widgets:
+              - label:
+                  align: CENTER
+                  text: "Fancoil"
+                  text_align: center
+                  text_font: font_grande
+            on_press:
+              - if:
+                  condition:
+                    lambda: |-
+                      return id(Ev_Fancoil).state || id(Ventola_Fancoil).state;
+                  then:
+                    - homeassistant.service:
+                        service: switch.turn_off
+                        data:
+                          entity_id: switch.esphome_web_75e2d0_relay_6
+                    - homeassistant.service:
+                        service: switch.turn_off
+                        data:
+                          entity_id: switch.esphome_web_75e2d0_relay_5
+                  else:
+                    - homeassistant.service:
+                        service: switch.turn_on
+                        data:
+                          entity_id: switch.esphome_web_75e2d0_relay_6
+                    - homeassistant.service:
+                        service: switch.turn_on
+                        data:
+                          entity_id: switch.esphome_web_75e2d0_relay_5
+        - button:
+            id: switch_btn_SpegniTutto2
+            align: BOTTOM_MID
+            y: -20
+            width: 540
+            height: 80
+            checkable: true
+            bg_color: "0x808080" 
+            widgets:
+              - label:
+                  align: CENTER
+                  text: 'Spegni Tutto'
+                  text_font: font_grande 
+            on_press:
+              - homeassistant.service:
+                  service: switch.turn_off
+                  data:
+                    entity_id: switch.esphome_web_76e200_relay_3            
+              - homeassistant.service:
+                  service: switch.turn_off
+                  data:
+                    entity_id: switch.esphome_web_76e200_relay_4
+              - homeassistant.service:
+                  service: switch.turn_off
+                  data:
+                    entity_id: switch.esphome_web_76e200_relay_6
+              - homeassistant.service:
+                  service: switch.turn_off
+                  data:
+                    entity_id: switch.esphome_web_75ea84_relay_1
+              - homeassistant.service:
+                  service: switch.turn_off
+                  data:
+                    entity_id: switch.esphome_web_75ea84_relay_2
+              - homeassistant.service:
+                  service: switch.turn_off
+                  data:
+                    entity_id: switch.esphome_web_75ea84_relay_5
+              - homeassistant.service:
+                  service: switch.turn_off
+                  data:
+                    entity_id: switch.esphome_web_75ea84_relay_6
+              - homeassistant.service:
+                  service: switch.turn_off
+                  data:        
+                    entity_id: switch.esphome_web_75ea84_relay_3
+              - homeassistant.service:
+                  service: switch.turn_off
+                  data:                 
+                    entity_id: switch.esphome_web_75ea84_relay_4
+              - homeassistant.service:
+                  service: switch.turn_off
+                  data: 
+                    entity_id:  switch.esphome_web_75e2d0_relay_6
+              - homeassistant.service:
+                  service: switch.turn_off
+                  data: 
+                    entity_id:  switch.esphome_web_75e2d0_relay_5
+              - homeassistant.service:
+                  service: switch.turn_off
+                  data: 
+                    entity_id:  switch.esphome_web_75e2d0_relay_4
+              - homeassistant.service:
+                  service: switch.turn_off
+                  data: 
+                    entity_id:  switch.esphome_web_75e2d0_relay_3
+              - homeassistant.service:
+                  service: switch.turn_off
+                  data: 
+                    entity_id:  switch.antela_smart_plug_it_presa_1
+              - delay: 1s
+              - lambda: |-
+                  lv_obj_add_state(id(switch_btn_SpegniTutto2), LV_STATE_CHECKED);
+              - delay: 1s
+              - lambda: |-
+                  lv_obj_clear_state(id(switch_btn_SpegniTutto2), LV_STATE_CHECKED);
+        
+        - image:
+            id: freccia_sinistraa
+            src: prev_icon 
+            align: LEFT_MID
+            x: 25
+            on_click:
+              - lvgl.page.previous:
+                  animation: OUT_RIGHT
+                  time: 700ms
+        - button:
+            id: prev_page_bottone
+            align: LEFT_MID
+            width: 130
+            height: 480
+            opa: 0  
+            on_click:
+              - lvgl.page.previous:
+                  animation: OUT_LEFT
+                  time: 700ms      
+        - image:
+            id: freccia_destraaa
+            src: next_icon 
+            align: RIGHT_MID
+            x: -25
+            on_click:
+              - lvgl.page.next:
+                  animation: OUT_LEFT
+                  time: 700ms
+        - button:
+            id: next_page_button2
+            align: RIGHT_MID
+            width: 130 
+            height: 480 
+            opa: 0 
+            on_click:
+              - lvgl.page.next:
+                  animation: OUT_LEFT
+                  time: 700ms
+
+    - id: quarta_pagina
+      widgets:
+        - button:
+            id: switch_btn_agente1
+            align: CENTER
+            x: -137 
+            y: -50
+            width: 266
+            height: 345
+            checkable: true
+            bg_color: "0x808080"
+            widgets:
+              - label:
+                  align: CENTER
+                  text: "Agente 1"
+                  text_align: center
+                  text_font: font_grande
+            on_press:
+              - homeassistant.service:
+                  service: switch.toggle
+                  data:
+                    entity_id: switch.esphome_web_75ea84_relay_6
+        - button:
+            id: switch_btn_agente2
+            align: CENTER
+            x: 137
+            y: -50
+            width: 266
+            height: 345
+            checkable: true
+            bg_color: "0x808080"
+            widgets:
+              - label:
+                  align: CENTER
+                  text: "Agente 2"
+                  text_align: center
+                  text_font: font_grande
+            on_press:
+              - homeassistant.service:
+                  service: switch.toggle
+                  data:
+                    entity_id: switch.esphome_web_75ea84_relay_5
+        - button:
+            id: switch_btn_SpegniTutto3
+            align: BOTTOM_MID
+            y: -20
+            width: 540
+            height: 80
+            checkable: true
+            bg_color: "0x808080" 
+            widgets:
+              - label:
+                  align: CENTER
+                  text: 'Spegni Tutto'
+                  text_font: font_grande 
+            on_press:
+              - homeassistant.service:
+                  service: switch.turn_off
+                  data:
+                    entity_id: switch.esphome_web_76e200_relay_3              
+              - homeassistant.service:
+                  service: switch.turn_off
+                  data:
+                    entity_id: switch.esphome_web_76e200_relay_4
+              - homeassistant.service:
+                  service: switch.turn_off
+                  data:
+                    entity_id: switch.esphome_web_76e200_relay_6
+              - homeassistant.service:
+                  service: switch.turn_off
+                  data:
+                    entity_id: switch.esphome_web_75ea84_relay_1
+              - homeassistant.service:
+                  service: switch.turn_off
+                  data:
+                    entity_id: switch.esphome_web_75ea84_relay_2
+              - homeassistant.service:
+                  service: switch.turn_off
+                  data:
+                    entity_id: switch.esphome_web_75ea84_relay_5
+              - homeassistant.service:
+                  service: switch.turn_off
+                  data:
+                    entity_id: switch.esphome_web_75ea84_relay_6
+              - homeassistant.service:
+                  service: switch.turn_off
+                  data:          
+                    entity_id: switch.esphome_web_75ea84_relay_3
+              - homeassistant.service:
+                  service: switch.turn_off
+                  data:                  
+                    entity_id: switch.esphome_web_75ea84_relay_4
+              - homeassistant.service:
+                  service: switch.turn_off
+                  data: 
+                    entity_id:  switch.esphome_web_75e2d0_relay_6
+              - homeassistant.service:
+                  service: switch.turn_off
+                  data: 
+                    entity_id:  switch.esphome_web_75e2d0_relay_5
+              - homeassistant.service:
+                  service: switch.turn_off
+                  data: 
+                    entity_id:  switch.esphome_web_75e2d0_relay_4
+              - homeassistant.service:
+                  service: switch.turn_off
+                  data: 
+                    entity_id:  switch.esphome_web_75e2d0_relay_3
+              - homeassistant.service:
+                  service: switch.turn_off
+                  data: 
+                    entity_id:  switch.antela_smart_plug_it_presa_1
+              - delay: 1s
+              - lambda: |-
+                  lv_obj_add_state(id(switch_btn_SpegniTutto3), LV_STATE_CHECKED);
+              - delay: 1s
+              - lambda: |-
+                  lv_obj_clear_state(id(switch_btn_SpegniTutto3), LV_STATE_CHECKED);
+        
+        - image:
+            id: freccia_sinistraa1
+            src: prev_icon 
+            align: LEFT_MID
+            x: 25
+            on_click:
+              - lvgl.page.previous:
+                  animation: OUT_RIGHT
+                  time: 700ms
+        - button:
+            id: prev_page_bottone3
+            align: LEFT_MID
+            width: 130
+            height: 480
+            opa: 0 
+            on_click:
+              - lvgl.page.previous:
+                  animation: OUT_LEFT
+                  time: 700ms      
+        - image:
+            id: freccia_destraaa1
+            src: next_icon 
+            align: RIGHT_MID
+            x: -25
+            on_click:
+              - lvgl.page.next:
+                  animation: OUT_LEFT
+                  time: 700ms
+        - button:
+            id: next_page_button3
+            align: RIGHT_MID
+            width: 130 
+            height: 480 
+            opa: 0 
+            on_click:
+              - lvgl.page.next:
+                  animation: OUT_LEFT
+                  time: 700ms
+
+    - id: pagina_nfc
+      widgets:
+        - label:
+            id: title_nfc
+            align: TOP_MID
+            y: 50
+            text: "TAG RILEVATO"
+            text_font: tag_font
+            text_color: 0xFFFFFF
+        - label:
+            id: nfc_id_label
+            align: CENTER
+            text: "--"
+            text_font: font2
+            text_align: center
+            text_color: 0xA8D5BA
+        - button:
+            align: BOTTOM_MID
+            y: -50
+            width: 200
+            height: 80
+            bg_color: "0x808080"
+            widgets:
+              - label:
+                  align: CENTER
+                  text: "Chiudi"
+                  text_font: font_grande
+            on_click:
+              - script.stop: reset_display
+              # Riattiva NFC se chiudi manualmente
+              - lambda: id(nfc_reader).set_update_interval(1000);
+              - lvgl.page.show: main_pages
+
+  on_idle:
+    timeout: 180s 
+    then:
+      - logger.log: "Schermo in inattività, spegnere retroilluminazione."
+      - light.turn_off: back_light 
+      - lvgl.pause: 
+
+interval:
+  - interval: 1s
+    then:
+      - lambda: |-
+          auto time = id(homeassistant_tempo).now();
+          if (time.is_valid()) {
+            int hour = time.hour;
+            int minute = time.minute;
+            char buffer[6];
+            sprintf(buffer, "%02d:%02d", hour, minute);
+            lv_label_set_text(static_cast<lv_obj_t*>(id(clock_label)), buffer);
+
+            char date_buffer[13];
+            sprintf(date_buffer, "%02d/%02d/%04d", time.day_of_month, time.month, time.year);
+            lv_label_set_text(static_cast<lv_obj_t*>(id(date_label)), date_buffer);
+          }
+          if (id(stato_ingresso_relay3).state || id(stato_ingresso_relay4).state) {
+            lv_obj_add_state(id(switch_btn_ingresso), LV_STATE_CHECKED);
+          } else {
+            lv_obj_clear_state(id(switch_btn_ingresso), LV_STATE_CHECKED);
+          }
+          if (id(stato_soppalco_relay1).state || id(stato_soppalco_relay2).state) {
+            lv_obj_add_state(id(switch_btn_soppalco), LV_STATE_CHECKED);
+          } else {
+            lv_obj_clear_state(id(switch_btn_soppalco), LV_STATE_CHECKED);
+          }
+          if (id(stato_agenti_relay5).state || id(stato_agenti_relay6).state) {
+            lv_obj_add_state(id(switch_btn_agenti), LV_STATE_CHECKED);
+          } else {
+            lv_obj_clear_state(id(switch_btn_agenti), LV_STATE_CHECKED);
+          }
+          if (id(Ev_Fancoil).state || id(Ventola_Fancoil).state) {
+            lv_obj_add_state(id(switch_btn_fancoil), LV_STATE_CHECKED);
+          } else {
+            lv_obj_clear_state(id(switch_btn_fancoil), LV_STATE_CHECKED);
+          }
+          if (id(stato_bagno_relay6).state || id(stato_cucinino).state) {
+            lv_obj_add_state(id(switch_btn_bagno), LV_STATE_CHECKED);
+          } else {
+            lv_obj_clear_state(id(switch_btn_bagno), LV_STATE_CHECKED);
+          }
+          if (id(stato_sala_riunioni).state) {
+            lv_obj_add_state(id(switch_btn_salariunioni), LV_STATE_CHECKED);
+          } else {
+            lv_obj_clear_state(id(switch_btn_salariunioni), LV_STATE_CHECKED);
+          }
+          if (id(stato_agenti_relay6).state) {
+            lv_obj_add_state(id(switch_btn_agente1), LV_STATE_CHECKED);
+          } else {
+            lv_obj_clear_state(id(switch_btn_agente1), LV_STATE_CHECKED);
+          }
+          if (id(stato_agenti_relay5).state) {
+            lv_obj_add_state(id(switch_btn_agente2), LV_STATE_CHECKED);
+          } else {
+            lv_obj_clear_state(id(switch_btn_agente2), LV_STATE_CHECKED);
+          }
