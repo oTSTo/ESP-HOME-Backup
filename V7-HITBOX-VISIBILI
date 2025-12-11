@@ -1,3 +1,5 @@
+#Per rimuovere le HitBox modificare opa: 40% a opa: 0%
+
 substitutions:
   name: schermo-nfc
   friendly_name: schermo-nfc
@@ -986,17 +988,11 @@ lvgl:
             id: title_nfc
             align: TOP_MID
             y: 50
-            text: "TAG RILEVATO"
+            text: "ULTIMO DIPENDENTE:"
             text_font: tag_font
             text_color: 0xFFFFFF
             
-        - label:
-            id: lbl_ultimo_dip
-            align: CENTER
-            y: -50  
-            text: "Ultimo Dipendente:"
-            text_font: font_label
-            text_color: 0xFFFFFF
+        
 
         - label:
             id: nfc_id_label
